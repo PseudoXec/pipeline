@@ -1,0 +1,39 @@
+# Person mode: person detect -> face detect -> send metadata.
+# Everything here is used by person mode only.
+# Relative paths are relative to this folder (modes/person/). Machine-specific overrides: config.local.yaml.
+
+weights: "models/person.onnx"
+face_weights: "models/face_detection_yunet_2023mar.onnx"
+imgsz: 416
+conf_threshold: 0.40
+classes: null # e.g. "person" if your model has several classes; null = accept all
+
+roi_filter: true # a person is "inside" when their FEET (bottom-centre of the box) are in the polygon
+roi_crop_detect: false # true = run the model only on the ROI window (faster, but people outside it are not seen)
+roi_crop_margin: 0.05
+roi_top_extra: 0.30 # that window also grows this far above the polygon, because people are tall
+
+jpeg_quality: 90
+face_jpeg_quality: 95
+
+face_enabled: true
+face_score_threshold: 0.7
+face_search_region: [0.0, 0.0, 1.0, 0.6] # where in the person box to look for a face: top 60%
+face_min_px: 40 # a face smaller than this (smaller side, px) is ignored
+face_min_sharpness: 40.0 # blurrier than this (Laplacian variance) is ignored
+
+save_images_to_disk: true
+send_via_api: true # needs api.person_endpoint_url and switches.api
+send_rows_without_face: true # false = people without a usable face stay local, they are never sent
+delete_row_after_api_send: true
+
+# One event per person instead of one per frame (ByteTrack-style tracker, core/tracker.py).
+tracking:
+  min_hits: 2 # a person must be seen this many times before they count
+  track_ttl_seconds: 2.0 # not seen for this long -> the track ends and its best result is stored
+  match_iou: 0.30
+  low_conf: 0.15 # weak boxes can keep a track alive (they never start one)
+  low_match_iou: 0.50
+  max_attempts: 5 # face-detection tries per person; the best face is kept
+  retry_interval_seconds: 0.3
+  accept_score: 0.60 # stop trying early once a face quality score is at least this (see face_ref_px / face_ref_sharpness)

@@ -1,0 +1,13 @@
+# Core detection stack
+ultralytics
+opencv-python>=4.8   # person mode's face detector (cv2.FaceDetectorYN, YuNet 2023mar) needs 4.8 or newer
+numpy
+
+# Configuration file parsing (config.yaml)
+pyyaml
+
+# NCNN inference support
+ncnn
+pnnx==20260526
+
+requests>=2.31.0
