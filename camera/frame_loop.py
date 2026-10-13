@@ -10,6 +10,7 @@ import cv2
 
 from camera.camera import ThreadedRTSPCamera, configure_decode_threads
 from config.config import PipelineConfig
+from core.timing import averages
 
 log = logging.getLogger("pipeline")
 
@@ -105,6 +106,7 @@ def run_on_stream(manager, config: PipelineConfig, initial_mode: str) -> None:
     max_frames = config.runtime.max_frames
     heartbeat_interval_seconds = 15.0
     last_heartbeat = time.time()
+    heartbeat_started = last_heartbeat
     last_heartbeat_frame_count = 0
     waited_for_first_frame = False
 
@@ -131,12 +133,24 @@ def run_on_stream(manager, config: PipelineConfig, initial_mode: str) -> None:
             frames_processed += 1
 
             if time.time() - last_heartbeat >= heartbeat_interval_seconds:
+                heartbeat_now = time.time()
                 new_frames = frames_processed - last_heartbeat_frame_count
+                elapsed = max(heartbeat_now - heartbeat_started, 1e-6)
+                timing_ms = averages()
+
+                def show_ms(name: str) -> str:
+                    value = timing_ms.get(name)
+                    return "n/a" if value is None else f"{value:.1f}"
+
                 log.info(
-                    "heartbeat: %d frame(s) processed in the last %.0fs (%d total) - still running",
-                    new_frames, heartbeat_interval_seconds, frames_processed,
+                    "heartbeat: %d frame(s) in %.1fs (%.2f fps, %d total) - avg ms: "
+                    "vehicle detect=%s plate=%s; person detect=%s face=%s",
+                    new_frames, elapsed, new_frames / elapsed, frames_processed,
+                    show_ms("vehicle_detect"), show_ms("plate_detect"),
+                    show_ms("person_detect"), show_ms("face_detect"),
                 )
-                last_heartbeat = time.time()
+                last_heartbeat = heartbeat_now
+                heartbeat_started = heartbeat_now
                 last_heartbeat_frame_count = frames_processed
 
             if config.switches.show_preview:

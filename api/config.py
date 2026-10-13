@@ -6,6 +6,7 @@ from typing import Optional
 @dataclass
 class ApiConfig:
     vehicle_endpoint_url: Optional[str] = None   # vehicle / plate events
+    send_vehicle_event_id: bool = False
     person_endpoint_url: Optional[str] = None    # person events (placeholder contract, see api/person_client.py)
     timeout_seconds: float = 5.0
 

@@ -1,28 +1,57 @@
+"""CPU-only ONNX Runtime inference for YOLOv8/YOLO11 detection exports."""
+import ast
 import gc
 import logging
 import os
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import cv2
 import numpy as np
 
-try:
-    from ultralytics import YOLO
-except ImportError:
-    YOLO = None
-
 log = logging.getLogger("pipeline")
+
+_inference_threads = 0
 
 
 class InferenceError(RuntimeError):
     pass
 
 
-def is_ncnn_export(path: str) -> bool:
-    return os.path.isdir(path) and any(name.endswith(".ncnn.param") for name in os.listdir(path))
+class OnnxDetector:
+    def __init__(self, session: Any):
+        self.session = session
+        self.input = session.get_inputs()[0]
+        self.input_name = self.input.name
+        self.output_name = session.get_outputs()[0].name
+        self.input_hw = _shape_hw(self.input.shape)
+        metadata = session.get_modelmeta().custom_metadata_map
+        raw_names = metadata.get("names")
+        if raw_names is None:
+            raise InferenceError("ONNX model metadata does not contain class names ('names')")
+        try:
+            parsed_names = ast.literal_eval(raw_names)
+        except (SyntaxError, ValueError) as error:
+            raise InferenceError(f"Invalid ONNX class-name metadata: {error}") from error
+        if isinstance(parsed_names, dict):
+            self.names = {int(index): str(name) for index, name in parsed_names.items()}
+        elif isinstance(parsed_names, (list, tuple)):
+            self.names = {index: str(name) for index, name in enumerate(parsed_names)}
+        else:
+            raise InferenceError("ONNX class-name metadata must be a mapping or sequence")
+        if not self.names:
+            raise InferenceError("ONNX class-name metadata is empty")
+
+
+def _runtime():
+    try:
+        import onnxruntime as ort
+    except ImportError as error:
+        raise ImportError("onnxruntime is required; install it with: pip install onnxruntime") from error
+    return ort
 
 
 def weights_exist(path: str) -> bool:
-    return os.path.isfile(path) or is_ncnn_export(path)
+    return os.path.isfile(path) and path.lower().endswith(".onnx")
 
 
 def resolve_inference_threads(configured: int) -> int:
@@ -45,111 +74,201 @@ def imgsz_hw(imgsz: "int | list | tuple") -> Tuple[int, int]:
 
 
 def limit_onnx_threads(configured: int) -> Optional[int]:
+    """Set the thread count that subsequent sessions use; no runtime monkeypatching is performed."""
+    global _inference_threads
     if configured < 0:
+        _inference_threads = 0
         return None
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        return None
-
-    threads = resolve_inference_threads(configured)
-    original_init = ort.InferenceSession.__init__
-    if getattr(original_init, "_thread_capped", False):
-        original_init = original_init._original
-
-    def capped_init(self, path_or_bytes, sess_options=None, *args, **kwargs):
-        if sess_options is None:
-            sess_options = ort.SessionOptions()
-        if not sess_options.intra_op_num_threads:
-            sess_options.intra_op_num_threads = threads
-        try:
-            sess_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
-        except Exception:
-            pass
-        original_init(self, path_or_bytes, sess_options, *args, **kwargs)
-
-    capped_init._thread_capped = True
-    capped_init._original = original_init
-    ort.InferenceSession.__init__ = capped_init
-    return threads
+    _inference_threads = resolve_inference_threads(configured)
+    return _inference_threads
 
 
-def onnx_static_input_hw(weights_path: str) -> Optional[Tuple[int, int]]:
-    if not (os.path.isfile(weights_path) and weights_path.lower().endswith(".onnx")):
-        return None
-    try:
-        import onnxruntime as ort
-        options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        options.intra_op_num_threads = 1
-        session = ort.InferenceSession(weights_path, options, providers=["CPUExecutionProvider"])
-        shape = session.get_inputs()[0].shape
-        height, width = shape[2], shape[3]
-        if isinstance(height, int) and isinstance(width, int):
-            return height, width
-    except Exception:
-        pass
+def _session_options():
+    ort = _runtime()
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = _inference_threads
+    options.inter_op_num_threads = 1
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return options
+
+
+def _shape_hw(shape: list) -> Optional[Tuple[int, int]]:
+    if len(shape) != 4:
+        raise InferenceError(f"Expected ONNX input shape [1, 3, H, W], got {shape}")
+    height, width = shape[2], shape[3]
+    if isinstance(height, int) and isinstance(width, int):
+        return height, width
     return None
 
 
-def load_model(weights_path: str, device: Optional[str] = None) -> Any:
-    if YOLO is None:
-        raise ImportError("ultralytics is not installed - run: pip install -r requirements.txt")
+def onnx_static_input_hw(weights_path: str) -> Optional[Tuple[int, int]]:
     if not weights_exist(weights_path):
-        raise FileNotFoundError(
-            f"Model weights not found at: {weights_path}\n"
-            f"Point config.model.vehicle_weights / plate_weights / person.weights at a .pt/.onnx file, "
-            f"or an exported *_ncnn_model folder."
+        return None
+    try:
+        ort = _runtime()
+        session = ort.InferenceSession(
+            weights_path, sess_options=_session_options(), providers=["CPUExecutionProvider"],
         )
-
-    if os.path.isfile(weights_path):
-        model = YOLO(weights_path)
-        if device:
-            model.to(device)
-    else:
-        model = YOLO(weights_path, task="detect")
-
-    return model
+        return _shape_hw(session.get_inputs()[0].shape)
+    except (ImportError, OSError, RuntimeError, ValueError) as error:
+        log.warning("[detector] could not read ONNX input shape for %s: %s", weights_path, error)
+        return None
 
 
-def warmup_model(model: Any, imgsz: "int | list | tuple", frame_shape: Optional[Tuple[int, int]] = None) -> None:
-    height, width = frame_shape if frame_shape else imgsz_hw(imgsz)
+def load_model(weights_path: str, device: Optional[str] = None) -> OnnxDetector:
+    del device  # CPUExecutionProvider is intentionally the only supported execution provider.
+    if not weights_exist(weights_path):
+        raise FileNotFoundError(f"ONNX model weights not found at: {weights_path}")
+    try:
+        ort = _runtime()
+        session = ort.InferenceSession(
+            weights_path, sess_options=_session_options(), providers=["CPUExecutionProvider"],
+        )
+        return OnnxDetector(session)
+    except (ImportError, OSError, RuntimeError, ValueError, TypeError) as error:
+        raise InferenceError(f"Could not load ONNX model {weights_path}: {error}") from error
+
+
+def _input_hw(model: OnnxDetector, imgsz: "int | list | tuple") -> Tuple[int, int]:
+    return model.input_hw or imgsz_hw(imgsz)
+
+
+def _letterbox(image: np.ndarray, target_hw: Tuple[int, int]):
+    target_height, target_width = target_hw
+    height, width = image.shape[:2]
+    scale = min(target_width / width, target_height / height)
+    resized_width = max(1, int(round(width * scale)))
+    resized_height = max(1, int(round(height * scale)))
+    resized = cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
+    pad_x, pad_y = target_width - resized_width, target_height - resized_height
+    left, top = int(round(pad_x / 2 - 0.1)), int(round(pad_y / 2 - 0.1))
+    right, bottom = pad_x - left, pad_y - top
+    padded = cv2.copyMakeBorder(
+        resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114),
+    )
+    tensor = padded[:, :, ::-1].transpose(2, 0, 1)
+    tensor = np.ascontiguousarray(tensor, dtype=np.float32) / 255.0
+    return (
+        tensor[None, ...],
+        resized_width / width,
+        resized_height / height,
+        left,
+        top,
+    )
+
+
+def warmup_model(
+    model: OnnxDetector, imgsz: "int | list | tuple", frame_shape: Optional[Tuple[int, int]] = None,
+) -> None:
+    height, width = frame_shape if frame_shape else _input_hw(model, imgsz)
     dummy_frame = np.zeros((height, width, 3), dtype=np.uint8)
     try:
-        model.predict(source=dummy_frame, imgsz=normalize_imgsz(imgsz), verbose=False)
+        tensor, _, _, _, _ = _letterbox(dummy_frame, _input_hw(model, imgsz))
+        model.session.run([model.output_name], {model.input_name: tensor})
     except Exception as error:
-        print(f"[warn] model warm-up failed (continuing anyway): {error}")
+        log.warning("[detector] model warm-up failed (continuing anyway): %s", error)
 
 
-def _boxes_to_predictions(result: Any, classes: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
-    boxes = result.boxes
-    if boxes is None or len(boxes) == 0:
+def _class_name(model: OnnxDetector, class_index: int) -> str:
+    return model.names.get(class_index, str(class_index))
+
+
+def _postprocess(
+    model: OnnxDetector,
+    output: np.ndarray,
+    original_hw: Tuple[int, int],
+    scale_x: float,
+    scale_y: float,
+    pad_x: int,
+    pad_y: int,
+    conf_threshold: float,
+    iou_threshold: float,
+    classes: Optional[Set[str]],
+    agnostic_nms: bool,
+    offset_x: int,
+    offset_y: int,
+) -> List[Dict[str, Any]]:
+    predictions = np.asarray(output)
+    if predictions.ndim == 3:
+        predictions = predictions[0]
+    if predictions.ndim != 2:
+        raise InferenceError(f"Unsupported YOLO output shape: {predictions.shape}")
+    if predictions.shape[0] == 4 + len(model.names):
+        predictions = predictions.T
+    elif predictions.shape[1] != 4 + len(model.names):
+        raise InferenceError(
+            f"Expected YOLO output with 4+{len(model.names)} channels, got {predictions.shape}"
+        )
+
+    if predictions.shape[1] == 0:
+        return []
+    class_scores = predictions[:, 4:]
+    class_indexes = np.argmax(class_scores, axis=1)
+    confidences = class_scores[np.arange(len(class_scores)), class_indexes]
+    keep = confidences >= conf_threshold
+    if classes:
+        keep &= np.array([_class_name(model, int(index)) in classes for index in class_indexes])
+    selected = np.flatnonzero(keep)
+    if selected.size == 0:
         return []
 
-    class_names = result.names
-    xywh = boxes.xywh.cpu().numpy()
-    confidences = boxes.conf.cpu().numpy()
-    class_indexes = boxes.cls.cpu().numpy().astype(int)
+    boxes = predictions[selected, :4].astype(np.float32, copy=True)
+    selected_scores = confidences[selected].astype(float)
+    selected_classes = class_indexes[selected].astype(int)
+    boxes[:, 0] -= boxes[:, 2] / 2
+    boxes[:, 1] -= boxes[:, 3] / 2
+    boxes[:, 2] += boxes[:, 0]
+    boxes[:, 3] += boxes[:, 1]
+    boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_x) / scale_x
+    boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_y) / scale_y
 
-    predictions: List[Dict[str, Any]] = []
-    for (cx, cy, width, height), confidence, class_index in zip(xywh, confidences, class_indexes):
-        class_name = class_names.get(int(class_index), str(class_index)) if isinstance(class_names, dict) else str(class_index)
-        if classes and class_name not in classes:
-            continue
-        predictions.append({
-            "x": float(cx),
-            "y": float(cy),
-            "width": float(width),
-            "height": float(height),
-            "class": class_name,
-            "confidence": float(confidence),
+    height, width = original_hw
+    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, width)
+    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, height)
+    valid = (
+        np.isfinite(boxes).all(axis=1)
+        & (boxes[:, 2] > boxes[:, 0])
+        & (boxes[:, 3] > boxes[:, 1])
+    )
+    boxes = boxes[valid]
+    selected_scores = selected_scores[valid]
+    selected_classes = selected_classes[valid]
+    if not len(boxes):
+        return []
+
+    nms_groups = [np.arange(len(boxes))] if agnostic_nms else [
+        np.flatnonzero(selected_classes == class_id) for class_id in np.unique(selected_classes)
+    ]
+    retained = []
+    for group in nms_groups:
+        rects = [
+            [float(boxes[index, 0]), float(boxes[index, 1]),
+             float(boxes[index, 2] - boxes[index, 0]), float(boxes[index, 3] - boxes[index, 1])]
+            for index in group
+        ]
+        indexes = cv2.dnn.NMSBoxes(
+            rects, [float(selected_scores[index]) for index in group], conf_threshold, iou_threshold,
+        )
+        if len(indexes):
+            retained.extend(int(group[int(index)]) for index in np.asarray(indexes).reshape(-1))
+
+    retained.sort(key=lambda index: selected_scores[index], reverse=True)
+    results = []
+    for index in retained:
+        x1, y1, x2, y2 = (float(value) for value in boxes[index])
+        results.append({
+            "x": (x1 + x2) / 2 + offset_x,
+            "y": (y1 + y2) / 2 + offset_y,
+            "width": x2 - x1,
+            "height": y2 - y1,
+            "class": _class_name(model, int(selected_classes[index])),
+            "confidence": float(selected_scores[index]),
         })
-
-    return predictions
+    return results
 
 
 def detect(
-    model: Any,
+    model: OnnxDetector,
     frame: np.ndarray,
     conf_threshold: float,
     iou_threshold: float,
@@ -158,88 +277,34 @@ def detect(
     region: Optional[Tuple[int, int, int, int]] = None,
     agnostic_nms: bool = False,
 ) -> List[Dict[str, Any]]:
+    if frame is None or frame.size == 0:
+        return []
     source = frame
     offset_x = offset_y = 0
     if region is not None:
         region_x1, region_y1, region_x2, region_y2 = region
-        if region_x2 > region_x1 and region_y2 > region_y1:
-            source = np.ascontiguousarray(frame[region_y1:region_y2, region_x1:region_x2])
-            offset_x, offset_y = region_x1, region_y1
+        region_x1, region_y1 = max(0, region_x1), max(0, region_y1)
+        region_x2, region_y2 = min(frame.shape[1], region_x2), min(frame.shape[0], region_y2)
+        if region_x2 <= region_x1 or region_y2 <= region_y1:
+            return []
+        source = np.ascontiguousarray(frame[region_y1:region_y2, region_x1:region_x2])
+        offset_x, offset_y = region_x1, region_y1
 
     try:
-        results = model.predict(
-            source=source, conf=conf_threshold, iou=iou_threshold, imgsz=normalize_imgsz(imgsz),
-            agnostic_nms=agnostic_nms, verbose=False,
+        tensor, scale_x, scale_y, pad_x, pad_y = _letterbox(source, _input_hw(model, imgsz))
+        output = model.session.run([model.output_name], {model.input_name: tensor})[0]
+        return _postprocess(
+            model, output, source.shape[:2], scale_x, scale_y, pad_x, pad_y,
+            conf_threshold, iou_threshold, classes, agnostic_nms, offset_x, offset_y,
         )
     except Exception as error:
+        if isinstance(error, InferenceError):
+            raise
         raise InferenceError(f"Detection failed: {error}") from error
-
-    if not results:
-        return []
-
-    predictions = _boxes_to_predictions(results[0], classes)
-    if offset_x or offset_y:
-        for p in predictions:
-            p["x"] += offset_x
-            p["y"] += offset_y
-    return predictions
-
-
-def detect_batch(
-    model: Any,
-    images: List[np.ndarray],
-    conf_threshold: float,
-    iou_threshold: float,
-    imgsz: int,
-    classes: Optional[Set[str]] = None,
-) -> List[List[Dict[str, Any]]]:
-    if not images:
-        return []
-
-    valid_indexes = [i for i, image in enumerate(images) if isinstance(image, np.ndarray) and image.size > 0]
-    if not valid_indexes:
-        return [[] for _ in images]
-
-    batch_images = [images[i] for i in valid_indexes]
-    results = None
-    if len(batch_images) == 1 or not getattr(model, "_batch_predict_unsupported", False):
-        try:
-            results = model.predict(source=batch_images, conf=conf_threshold, iou=iou_threshold,
-                                    imgsz=normalize_imgsz(imgsz), verbose=False)
-        except Exception as error:
-            if len(batch_images) == 1:
-                raise InferenceError(f"Batch detection failed on 1 image: {error}") from error
-            model._batch_predict_unsupported = True
-
-    if results is None:
-        try:
-            results = []
-            for image in batch_images:
-                results.extend(model.predict(source=[image], conf=conf_threshold, iou=iou_threshold,
-                                             imgsz=normalize_imgsz(imgsz), verbose=False))
-        except Exception as error:
-            raise InferenceError(f"Batch detection failed on {len(batch_images)} image(s): {error}") from error
-
-    predictions_by_result = [_boxes_to_predictions(result, classes) for result in results]
-
-    output: List[List[Dict[str, Any]]] = [[] for _ in images]
-    for position, original_index in enumerate(valid_indexes):
-        output[original_index] = predictions_by_result[position]
-    return output
 
 
 def release_models(*models: Any) -> None:
     for model in models:
-        if model is None:
-            continue
-        try:
-            if hasattr(model, "predictor"):
-                model.predictor = None
-        except Exception:
-            pass
+        if isinstance(model, OnnxDetector):
+            model.session = None
     gc.collect()
-    try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass

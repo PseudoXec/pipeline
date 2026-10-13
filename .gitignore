@@ -4,6 +4,9 @@ __pycache__/
 
 # runtime data (database, saved plate/face images, mode state)
 data/
+data/*.db
+data/*.db-wal
+data/*.db-shm
 output/
 *.db
 *.db-wal

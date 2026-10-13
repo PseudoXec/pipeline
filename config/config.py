@@ -34,7 +34,7 @@ class RuntimeConfig:
     max_frames: int = 0
     device_id: Optional[str] = None             # stamped on person events; default = this machine's hostname
     device: Optional[str] = None                # model device, null = auto
-    inference_threads: int = 0                  # ONNX Runtime CPU threads: 0 = auto, -1 = no limit
+    inference_threads: int = 3                  # Set back to 2 if FPS drops (Pi 5 has 4 cores)
 
 
 @dataclass

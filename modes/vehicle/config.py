@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, Dict, List, Optional, Union
 
+from core.motion_gate import FrameSkipConfig
 from core.tracker import TrackingConfig
 
 HERE = Path(__file__).resolve().parent
@@ -20,7 +21,7 @@ class ModelConfig:
 
     vehicle_conf_threshold: float = 0.40
     vehicle_iou_threshold: float = 0.40
-    plate_conf_threshold: float = 0.35
+    plate_conf_threshold: float = 0.60
 
     vehicle_classes: Optional[str] = None
     agnostic_nms: bool = True
@@ -54,14 +55,33 @@ class ImagesConfig:
 
 
 @dataclass
+class PlateValidationConfig:
+    enabled: bool = True
+    min_aspect_ratio: float = 1.2
+    max_aspect_ratio: float = 6.0
+    min_center_x_ratio: float = 0.20
+    max_center_x_ratio: float = 0.80
+    min_center_y_ratio: float = 0.25
+    min_width_ratio: float = 0.06
+    max_width_ratio: float = 0.55
+    min_height_px: int = 24
+    min_sharpness: float = 20.0
+
+
+@dataclass
 class FeaturesConfig:
     roi_filter: bool = True
     roi_crop_detect: bool = True
     plate_detection: bool = True
-    save_images_to_disk: bool = True
+    save_images_to_disk: bool = False
     print_console: bool = True
     send_via_api: bool = True
     delete_row_after_api_send: bool = True
+    store_without_plate: bool = True
+    dedupe_enabled: bool = True
+    dedupe_window_seconds: float = 30.0
+    dedupe_similarity: float = 0.85
+    dedupe_min_box_iou: float = 0.4
 
 
 @dataclass
@@ -70,5 +90,7 @@ class VehicleConfig:
     crop: CropConfig = field(default_factory=CropConfig)
     roi: RoiRulesConfig = field(default_factory=RoiRulesConfig)
     images: ImagesConfig = field(default_factory=ImagesConfig)
+    plate_validation: PlateValidationConfig = field(default_factory=PlateValidationConfig)
     features: FeaturesConfig = field(default_factory=FeaturesConfig)
     tracking: TrackingConfig = field(default_factory=lambda: TrackingConfig(max_attempts=3, retry_interval_seconds=0.3, accept_score=0.60))
+    frame_skip: FrameSkipConfig = field(default_factory=FrameSkipConfig)

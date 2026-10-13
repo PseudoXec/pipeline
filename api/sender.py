@@ -56,32 +56,29 @@ class ApiSender:
 
     def send(self, record: Any) -> Tuple[SendResult, Optional[str]]:
         """Dispatch to send_vehicle or send_person based on record type."""
-        # Use class name check or isinstance
         cls_name = record.__class__.__name__
         if cls_name == "VehicleRecord" or hasattr(record, "vehicle_confidence"):
-            result = self.send_vehicle(record)
-            return result, None if result == SendResult.SENT else str(result.value)
+            return self.send_vehicle(record)
         elif cls_name == "PersonRecord" or hasattr(record, "event_uuid"):
             return self.send_person(record)
         else:
             log.warning("[api] unknown record type: %s", type(record))
             return SendResult.FAILED, f"unknown record type {type(record)}"
 
-    def send_vehicle(self, record: "VehicleRecord") -> SendResult:
+    def send_vehicle(self, record: "VehicleRecord") -> Tuple[SendResult, Optional[str]]:
         endpoint_url = self.config.vehicle_endpoint_url
         if not endpoint_url:
-            log.warning("[api] send_via_api is on but no api.vehicle_endpoint_url is configured - skipping send")
-            return SendResult.FAILED
-
-        if not record.plate_detected:
-            log.debug("[api] skipping send for %s: no plate detected", record.track_id)
-            return SendResult.SKIPPED
+            detail = "api.vehicle_endpoint_url is not set"
+            log.warning("[api] %s", detail)
+            return SendResult.FAILED, detail
 
         params: Dict[str, Any] = {
             "DetectionConfidence": round(record.vehicle_confidence or 0.0, 2),
             "DetectedVehicle": record.vehicle_class or "Unknown",
             "TimeStamp": utc_timestamp(record.detected_at),
         }
+        if self.config.send_vehicle_event_id and record.event_uuid:
+            params["EventId"] = record.event_uuid
         # The camera's own id (api.camera_id - the same one used to fetch its ROI and sent as CameraId for
         # people). It used to be hard-coded to 1, which filed every camera's detections under camera 1.
         if self.config.camera_id is not None:
@@ -108,16 +105,17 @@ class ApiSender:
                 files=image_files,
                 timeout=self.config.timeout_seconds,
             )
-            response.raise_for_status()
-            return SendResult.SENT
-        except requests.exceptions.HTTPError as error:
-            error_body = error.response.text if error.response is not None else "No response body"
-            log.warning("[api] failed to send vehicle %s (HTTP %s): %s",
-                        record.track_id, error.response.status_code if error.response else "?", error_body)
-            return SendResult.FAILED
+            status = response.status_code
+            if 200 <= status < 300:
+                return SendResult.SENT, None
+            detail = f"HTTP {status}: {response.text[:200]}"
+            log.warning("[api] vehicle %s response: %s", record.track_id, detail)
+            if status in _PERMANENT_4XX:
+                return SendResult.REJECTED, detail
+            return SendResult.FAILED, detail
         except requests.RequestException as error:
             log.warning("[api] network error sending vehicle %s: %s", record.track_id, error)
-            return SendResult.FAILED
+            return SendResult.FAILED, f"network: {error}"
 
     def send_person(self, record: "PersonRecord") -> Tuple[SendResult, Optional[str]]:
         endpoint_url = self.config.person_endpoint_url
@@ -157,11 +155,11 @@ class ApiSender:
             return SendResult.FAILED, f"network: {error}"
 
         status = response.status_code
-        if 200 <= status < 300 or status == 409:
+        if 200 <= status < 300:
             return SendResult.SENT, None
 
         body = response.text[:200]
-        log.warning("[api] person %s rejected (HTTP %s): %s", record.track_id, status, body)
+        log.warning("[api] person %s response (HTTP %s): %s", record.track_id, status, body)
         if status in _PERMANENT_4XX:
             return SendResult.REJECTED, f"HTTP {status}: {body}"
         return SendResult.FAILED, f"HTTP {status}: {body}"

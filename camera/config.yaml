@@ -1,8 +1,8 @@
-# Camera settings. Machine-specific values (the RTSP password!) can go in camera/config.local.yaml,
+﻿# Camera settings. Machine-specific values (the RTSP password!) can go in camera/config.local.yaml,
 # which is merged on top of this file and ignored by git.
 camera:
   source_mode: "static" # "static" | "api"
-  rtsp_url: "rtsp://admin:Victoria2313*@192.168.100.224:554/stream1"
+  rtsp_url: "rtsp://admin:Victoria2313*@192.168.100.224:554/Streaming/Channels/101" # RTSP URL of the camera. Use the camera's IP address in place of CAMERA_IP.
   frame_width: 3840
   frame_height: 2160
   capture_buffer_size: 1

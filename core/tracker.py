@@ -24,7 +24,7 @@ import numpy as np
 
 try:
     from scipy.optimize import linear_sum_assignment
-except ImportError:  # scipy ships with ultralytics, but never hard-fail on it
+except ImportError:  # The greedy assignment fallback keeps SciPy optional.
     linear_sum_assignment = None
 
 
@@ -39,6 +39,10 @@ class TrackingConfig:
     max_attempts: int = 3               # second-stage (plate / face) tries per track before giving up
     retry_interval_seconds: float = 0.3 # minimum gap between two tries on the same track
     accept_score: float = 0.60          # stop trying early once a result scores at least this
+    no_plate_retry_interval_seconds: float = 0.5
+    no_plate_max_attempts: int = 12
+    no_face_retry_interval_seconds: float = 0.5
+    no_face_max_attempts: int = 12
 
 
 @dataclass
@@ -49,6 +53,7 @@ class TrackState:
     finalized: bool = False
     best: Optional[Dict[str, Any]] = None
     best_score: float = float("-inf")
+    rejections: Dict[str, int] = field(default_factory=dict)
 
 
 class Track:
@@ -167,6 +172,11 @@ class ByteTracker:
         self.high_conf = high_conf
         self._tracks: List[Track] = []
         self._next_id = 1
+
+    @property
+    def tracks(self) -> Tuple[Track, ...]:
+        """All current tracks, including tentative and briefly unmatched tracks."""
+        return tuple(self._tracks)
 
     def reset(self) -> None:
         self._tracks.clear()

@@ -21,7 +21,7 @@ mode:
 
 # On / off
 switches:
-  api: true # master switch: off = no ROI fetch, no camera source fetch, nothing is sent to the command center
+  api: false # master switch: off = no ROI fetch, no camera source fetch, nothing is sent to the command center
   roi_fetch_from_api: true
   show_preview: false # local OpenCV window (desktop testing only)
 
@@ -32,4 +32,4 @@ runtime:
   max_frames: 0 # 0 = run forever
   device_id: null # stamped on person events; null = this machine's hostname
   device: null # model device, null = auto
-  inference_threads: 2 # ONNX Runtime CPU threads: 0 = auto, -1 = no limit
+  inference_threads: 3 # Pi 5 has 4 cores; set back to 2 if FPS drops

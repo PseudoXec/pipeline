@@ -8,7 +8,7 @@ model:
   vehicle_imgsz: [512, 896] # [height, width] - must match vehicle.onnx's static shape
   plate_imgsz: 640 # must match platenum_closeup.onnx's static shape
   vehicle_conf_threshold: 0.40
-  plate_conf_threshold: 0.35
+  plate_conf_threshold: 0.60
   vehicle_classes: null # e.g. "car,truck,bus,motorcycle"; null = accept all
   agnostic_nms: true # one box per vehicle even when the model flips between classes
 
@@ -26,14 +26,31 @@ images:
   jpeg_quality: 90
   plate_jpeg_quality: 96
 
+plate_validation:
+  enabled: true
+  min_aspect_ratio: 1.2
+  max_aspect_ratio: 6.0
+  min_center_x_ratio: 0.20
+  max_center_x_ratio: 0.80
+  min_center_y_ratio: 0.25
+  min_width_ratio: 0.06
+  max_width_ratio: 0.55
+  min_height_px: 24
+  min_sharpness: 20.0
+
 features:
   roi_filter: true
   roi_crop_detect: true
   plate_detection: true
-  save_images_to_disk: true
+  save_images_to_disk: false
   print_console: true
   send_via_api: true # needs api.vehicle_endpoint_url and switches.api
   delete_row_after_api_send: true
+  store_without_plate: true
+  dedupe_enabled: true
+  dedupe_window_seconds: 30
+  dedupe_similarity: 0.85
+  dedupe_min_box_iou: 0.4 # an earlier event only counts as the same vehicle if its box overlaps this much
 
 # One event per vehicle instead of one per frame (ByteTrack-style tracker, core/tracker.py).
 tracking:
@@ -45,3 +62,11 @@ tracking:
   max_attempts: 3 # plate-detection tries per vehicle; the best plate is kept
   retry_interval_seconds: 0.3 # gap between two tries on the same vehicle
   accept_score: 0.60 # stop trying early once a plate is at least this confident
+  no_plate_retry_interval_seconds: 0.5
+  no_plate_max_attempts: 12
+
+frame_skip:
+  enabled: true
+  motion_threshold: 0.01
+  follow_every_n: 3
+  idle_heartbeat_seconds: 2.0

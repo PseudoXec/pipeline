@@ -5,6 +5,6 @@ storage:
   database_path: "data/pipeline_buffer.db"
   output_dir: "output"
   retention_days: 3
-  max_unsynced_days: 0
+  max_unsynced_days: 3
   delete_disk_images_after_send: true
-  send_retry_seconds: 60
+  max_reject_attempts: 3

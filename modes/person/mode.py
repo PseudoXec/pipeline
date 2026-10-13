@@ -13,7 +13,9 @@ import numpy as np
 
 from core import detector
 from core.geometry import crop_box
+from core.motion_gate import MotionGate
 from core.tracker import ByteTracker, Track
+from core.timing import timer
 from modes.base import DetectionMode, RuntimeContext
 from modes.person.face import YuNetFaceDetector
 from modes.person.geometry import is_person_inside_roi
@@ -38,6 +40,7 @@ class PersonMode(DetectionMode):
         self.person_model = None
         self.face_detector: Optional[YuNetFaceDetector] = None
         self.tracker = ByteTracker(self.cfg.tracking, high_conf=self.cfg.conf_threshold)
+        self.motion_gate = MotionGate(self.cfg.frame_skip)
         self._session_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._stopped = False
 
@@ -63,6 +66,7 @@ class PersonMode(DetectionMode):
             self.face_detector = YuNetFaceDetector(
                 cfg.face_weights, cfg.face_score_threshold, cfg.face_search_region,
                 cfg.face_min_px, cfg.face_min_sharpness, cfg.face_ref_px, cfg.face_ref_sharpness,
+                cfg.face_detect_max_side, cfg.face_validation,
             )
         else:
             log.warning("[person] face_enabled is OFF - people will be stored without faces")
@@ -71,7 +75,7 @@ class PersonMode(DetectionMode):
         self.classes = {c.strip() for c in classes.split(",") if c.strip()} if classes else None
 
     def _sync_imgsz(self) -> None:
-        actual = detector.onnx_static_input_hw(self.cfg.weights)
+        actual = self.person_model.input_hw
         if actual is None:
             return
         configured = detector.imgsz_hw(self.cfg.imgsz)
@@ -113,10 +117,17 @@ class PersonMode(DetectionMode):
         # 1. Person detect. The model runs at the lower tracking.low_conf so weak boxes can keep an existing
         #    track alive; the tracker only lets boxes >= conf_threshold START a track.
         region = self._detect_region(frame.shape)
-        predictions = detector.detect(
-            self.person_model, frame, min(cfg.conf_threshold, tcfg.low_conf), cfg.iou_threshold, cfg.imgsz,
-            self.classes, region=region, agnostic_nms=cfg.agnostic_nms,
-        )
+        if not self.motion_gate.should_run(
+            frame, self.tracker.tracks, now, region, always_run=always_finalize,
+        ):
+            update = self.tracker.update([], now)
+            return sum(self._finalize(track) for track in update.expired)
+
+        with timer("person_detect").measure():
+            predictions = detector.detect(
+                self.person_model, frame, min(cfg.conf_threshold, tcfg.low_conf), cfg.iou_threshold, cfg.imgsz,
+                self.classes, region=region, agnostic_nms=cfg.agnostic_nms,
+            )
 
         # Filter to ROI (feet check)
         if cfg.roi_filter:
@@ -135,11 +146,19 @@ class PersonMode(DetectionMode):
             state = track.data
             if state.finalized:
                 continue                                    # already reported; just keep following them
-            if state.attempts and now - state.last_attempt < tcfg.retry_interval_seconds:
+            has_face = bool(state.best and state.best["face_detected"])
+            retry_interval = (tcfg.retry_interval_seconds if has_face or self.face_detector is None
+                              else tcfg.no_face_retry_interval_seconds)
+            if state.attempts and now - state.last_attempt < retry_interval:
                 continue
             self._attempt(track, frame, now)
-            done = (always_finalize or self.face_detector is None
-                    or state.best_score >= tcfg.accept_score or state.attempts >= tcfg.max_attempts)
+            has_face = bool(state.best and state.best["face_detected"])
+            done = (
+                always_finalize or self.face_detector is None
+                or (has_face and state.best_score >= tcfg.accept_score)
+                or (has_face and state.attempts >= tcfg.max_attempts)
+                or (not has_face and state.attempts >= tcfg.no_face_max_attempts)
+            )
             if done:
                 stored += self._finalize(track)
 
@@ -159,8 +178,9 @@ class PersonMode(DetectionMode):
         prediction = track.det
 
         # 3. Crop person
+        original_person_crop = crop_box(frame, prediction, cfg.padding_ratio, 0)
         person_crop = crop_box(frame, prediction, cfg.padding_ratio, cfg.min_crop_height)
-        if person_crop is None:
+        if original_person_crop is None or person_crop is None:
             return
 
         # 4. Face detect + crop
@@ -168,34 +188,50 @@ class PersonMode(DetectionMode):
         face_landmarks: Optional[str] = None
         face_quality: Optional[float] = None
         if self.face_detector is not None:
-            hit = self.face_detector.detect(person_crop)
+            face_source_crop = original_person_crop if cfg.face_validation.enabled else person_crop
+            with timer("face_detect").measure():
+                hit = self.face_detector.detect(face_source_crop)
+            for reason, count in self.face_detector.last_rejections.items():
+                state.rejections[reason] = state.rejections.get(reason, 0) + count
             if hit is not None and hit.passed_gate:
                 fx1, fy1, fx2, fy2 = hit.box
                 margin_x, margin_y = (fx2 - fx1) * cfg.face_margin, (fy2 - fy1) * cfg.face_margin
-                crop_h, crop_w = person_crop.shape[:2]
+                crop_h, crop_w = face_source_crop.shape[:2]
                 x1, y1 = max(0, int(fx1 - margin_x)), max(0, int(fy1 - margin_y))
                 x2, y2 = min(crop_w, int(fx2 + margin_x)), min(crop_h, int(fy2 + margin_y))
-                candidate = person_crop[y1:y2, x1:x2]
+                candidate = face_source_crop[y1:y2, x1:x2]
                 if candidate.size > 0:
                     face_crop = candidate
                     face_landmarks = json.dumps([[round(x, 1), round(y, 1)] for x, y in hit.landmarks])
                     face_quality = round(hit.quality, 4)
+                else:
+                    state.rejections["size"] = state.rejections.get("size", 0) + 1
+            elif hit is not None and not hit.passed_gate:
+                if min(hit.box[2] - hit.box[0], hit.box[3] - hit.box[1]) < cfg.face_min_px:
+                    state.rejections["small"] = state.rejections.get("small", 0) + 1
+                if hit.sharpness < cfg.face_min_sharpness:
+                    state.rejections["blurry"] = state.rejections.get("blurry", 0) + 1
 
-        # A usable face always beats no face; among faces the higher quality wins; among no-faces the surer person.
+        # A usable face always beats no face; confidence ranks person-only candidates when allowed.
         person_confidence = float(prediction.get("confidence", 0.0))
         score = face_quality if face_crop is not None else person_confidence - 1.0
         if score <= state.best_score:
             return
 
         # Only the winning try is JPEG-encoded (keeps the CPU cost of retries low).
+        person_jpeg = encode_jpeg(person_crop, cfg.jpeg_quality)
+        face_jpeg = encode_jpeg(face_crop, cfg.face_jpeg_quality) if face_crop is not None else None
         state.best_score = score
         state.best = {
             "person_confidence": person_confidence,
-            "person_jpeg": encode_jpeg(person_crop, cfg.jpeg_quality),
+            "person_jpeg": person_jpeg,
+            "person_size": (person_crop.shape[1], person_crop.shape[0]),
             "face_detected": face_crop is not None,
-            "face_jpeg": encode_jpeg(face_crop, cfg.face_jpeg_quality) if face_crop is not None else None,
+            "face_jpeg": face_jpeg,
+            "face_size": (face_crop.shape[1], face_crop.shape[0]) if face_crop is not None else None,
             "face_landmarks": face_landmarks,
             "face_quality": face_quality,
+            "frame_size": (frame.shape[1], frame.shape[0]),
             "at": datetime.now(),
         }
 
@@ -208,7 +244,8 @@ class PersonMode(DetectionMode):
         best, state.best = state.best, None                # drop the JPEG bytes either way
         if best is None:
             return 0
-
+        if self.face_detector is not None and not best["face_detected"] and not self.cfg.store_without_face:
+            return 0
         track_id = f"p{track.id}"
         stem = f"{self._session_tag}_{track_id}"
         disk_files: Optional[dict] = {} if self.cfg.save_images_to_disk else None
@@ -233,8 +270,25 @@ class PersonMode(DetectionMode):
         ))
 
         status = f"face found (q={best['face_quality']:.2f})" if best["face_detected"] else "no face"
-        print(f"[person] {track_id} ({best['person_confidence']:.2f}) - {status} [{state.attempts} try/tries]")
+        if not best["face_detected"]:
+            rejected = self._format_rejections(state.rejections)
+            if rejected:
+                status += f" (rejected: {rejected})"
+        frame_width, frame_height = best["frame_size"]
+        person_width, person_height = best["person_size"]
+        details = (f"frame {frame_width}x{frame_height}, person {person_width}x{person_height} "
+                   f"({len(best['person_jpeg']) / 1024:.0f} KB)")
+        if best["face_jpeg"] is not None:
+            face_width, face_height = best["face_size"]
+            details += f", face {face_width}x{face_height} ({len(best['face_jpeg']) / 1024:.0f} KB)"
+        print(f"[person] {track_id} ({best['person_confidence']:.2f}) - {status} "
+              f"[{details}] [{state.attempts} tries]")
         return 1
+
+    @staticmethod
+    def _format_rejections(rejections: dict) -> str:
+        order = ("confidence", "aspect", "position", "size", "landmarks", "small", "blurry")
+        return ", ".join(f"{reason} {rejections[reason]}" for reason in order if rejections.get(reason))
 
     def _flush_pending(self) -> None:
         """Hand every person still being followed to storage (mode switch / shutdown): nothing is lost."""

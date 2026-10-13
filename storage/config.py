@@ -16,7 +16,7 @@ class StorageConfig:
     write_flush_interval_seconds: float = 1.0
 
     retention_days: int = 3
-    max_unsynced_days: int = 0
+    max_unsynced_days: int = 3
 
     delete_disk_images_after_send: bool = True
-    send_retry_seconds: float = 60.0
+    max_reject_attempts: int = 3

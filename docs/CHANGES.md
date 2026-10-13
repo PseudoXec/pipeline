@@ -1,3 +1,17 @@
+# Lean pipeline pass (latest)
+
+- Motion/idle frame skipping, YuNet input cap (480 px), person ROI detect, onnxruntime instead of ultralytics, 3 inference threads with timing in the heartbeat.
+- Vehicles without a valid plate and people without a valid face remain events; strict plate/face validation prevents invalid second-stage crops. Vehicle JPEG is kept; disk copies are off by default.
+- Storage: writer, image-file and sender threads. API down -> rows are kept and retried (5 s up to 60 s, 3 days max). Permanent 4xx -> dropped after 3 tries. Sent -> row deleted.
+- The tables below describe the earlier optimization pass; its file names and retry rules are superseded by this section.
+- Vehicle events now have optional UUIDs, controlled by `api.send_vehicle_event_id`.
+- Recent plate thumbnails suppress repeated vehicle reports locally within the configured dedupe window.
+- Person runtime model documentation now specifies FP32 `person.onnx` at 416 px; export tools use `requirements-export.txt`.
+- Removed the obsolete `SKIPPED` send result and rejected-row status count.
+- No-plate and no-face events are sent without a plate/face image; validation rejection counts are shown when stored.
+- Added strict plate geometry/sharpness and face geometry/landmark validation, with longer retries while a track remains visible.
+- Console event lines now include source frame and saved-crop dimensions and JPEG sizes.
+
 # Optimization pass - what changed
 
 | Area | Change | Files |
@@ -145,3 +159,7 @@ Behaviour changes to be aware of:
 * A vehicle/person is stored after its first good result, not on first sight - up to `max_attempts x retry_interval_seconds` (~1 s for vehicles) later, or when they leave.
 * `min_hits: 2` means a one-frame ghost detection never becomes an event. Set `min_hits: 1` to trust every detection.
 * The models now run at `tracking.low_conf` (0.15) so weak boxes can keep a track alive; they still cannot start one.
+
+## CPU runtime, frame gating, and delivery
+
+Vehicle and person inference now use CPU ONNX Runtime directly. Idle frames are motion-gated, YuNet input is capped at 480 px, and plate-less vehicle / faceless person events can be retained without their second-stage images. SQLite writing and HTTP delivery run on separate threads with persistent retry state, 5-second exponential backoff, and three-day unsent-row retention. Runtime requirements and camera credentials were separated from export tools and committed config.

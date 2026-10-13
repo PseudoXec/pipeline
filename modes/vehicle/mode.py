@@ -4,14 +4,19 @@
 """
 import logging
 import time
+import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 
 from core import detector
+from core.dedupe import RecentPlates
 from core.geometry import box_edges, crop_box
+from core.motion_gate import MotionGate
 from core.tracker import ByteTracker, Track
+from core.timing import timer
 from modes.base import DetectionMode, RuntimeContext
 from modes.vehicle.geometry import crop_plate, is_inside_roi
 from storage.buffer import VehicleRecord, encode_jpeg
@@ -34,6 +39,12 @@ class VehicleMode(DetectionMode):
         self.vehicle_model = None
         self.plate_model = None
         self.tracker = ByteTracker(self.config.tracking, high_conf=self.config.model.vehicle_conf_threshold)
+        self.motion_gate = MotionGate(self.config.frame_skip)
+        self.recent_plates = RecentPlates(
+            self.config.features.dedupe_window_seconds,
+            self.config.features.dedupe_similarity,
+            self.config.features.dedupe_min_box_iou,
+        )
         self._session_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._stopped = False
 
@@ -54,8 +65,8 @@ class VehicleMode(DetectionMode):
         self.vehicle_model = detector.load_model(config.model.vehicle_weights, runtime.device)
         print("[vehicle] loading plate model...")
         self.plate_model = detector.load_model(config.model.plate_weights, runtime.device)
-        self._sync_imgsz_with_model("vehicle", config.model.vehicle_weights, "vehicle_imgsz")
-        self._sync_imgsz_with_model("plate", config.model.plate_weights, "plate_imgsz")
+        self._sync_imgsz_with_model("vehicle", self.vehicle_model, "vehicle_imgsz")
+        self._sync_imgsz_with_model("plate", self.plate_model, "plate_imgsz")
 
         classes = config.model.vehicle_classes
         self.vehicle_classes = {c.strip() for c in classes.split(",") if c.strip()} if classes else None
@@ -68,14 +79,14 @@ class VehicleMode(DetectionMode):
         detector.warmup_model(self.vehicle_model, self.config.model.vehicle_imgsz, frame_shape)
         detector.warmup_model(self.plate_model, self.config.model.plate_imgsz)
 
-    def _sync_imgsz_with_model(self, label: str, weights: str, attribute: str) -> None:
-        actual = detector.onnx_static_input_hw(weights)
+    def _sync_imgsz_with_model(self, label: str, model, attribute: str) -> None:
+        actual = model.input_hw
         if actual is None:
             return
         configured = detector.imgsz_hw(getattr(self.config.model, attribute))
         if actual != configured:
-            log.warning("[vehicle] %s model %s static shape %dx%d != configured %dx%d; using %dx%d",
-                        label, weights, actual[0], actual[1], configured[0], configured[1], actual[0], actual[1])
+            log.warning("[vehicle] %s model static shape %dx%d != configured %dx%d; using %dx%d",
+                        label, actual[0], actual[1], configured[0], configured[1], actual[0], actual[1])
             setattr(self.config.model, attribute, [actual[0], actual[1]])
 
     def _get_detect_region(self, frame_shape: tuple) -> Optional[Tuple[int, int, int, int]]:
@@ -99,12 +110,19 @@ class VehicleMode(DetectionMode):
         # 1. Vehicle detect. The model runs at the lower tracking.low_conf so weak boxes can keep an existing
         #    track alive; the tracker only lets boxes >= vehicle_conf_threshold START a track.
         region = self._get_detect_region(frame_shape)
-        predictions = detector.detect(
-            self.vehicle_model, frame,
-            min(cfg.model.vehicle_conf_threshold, tcfg.low_conf), cfg.model.vehicle_iou_threshold,
-            cfg.model.vehicle_imgsz, self.vehicle_classes, region=region,
-            agnostic_nms=cfg.model.agnostic_nms,
-        )
+        if not self.motion_gate.should_run(
+            frame, self.tracker.tracks, now, region, always_run=always_finalize,
+        ):
+            update = self.tracker.update([], now)
+            return sum(self._finalize(track) for track in update.expired)
+
+        with timer("vehicle_detect").measure():
+            predictions = detector.detect(
+                self.vehicle_model, frame,
+                min(cfg.model.vehicle_conf_threshold, tcfg.low_conf), cfg.model.vehicle_iou_threshold,
+                cfg.model.vehicle_imgsz, self.vehicle_classes, region=region,
+                agnostic_nms=cfg.model.agnostic_nms,
+            )
         predictions = [p for p in predictions if not self._looks_like_plate(p)]
 
         # Filter to ROI
@@ -129,11 +147,19 @@ class VehicleMode(DetectionMode):
             state = track.data
             if state.finalized:
                 continue                                    # already reported; just keep following it
-            if state.attempts and now - state.last_attempt < tcfg.retry_interval_seconds:
+            has_plate = bool(state.best and state.best["plate_detected"])
+            retry_interval = (tcfg.retry_interval_seconds if has_plate or not features.plate_detection
+                              else tcfg.no_plate_retry_interval_seconds)
+            if state.attempts and now - state.last_attempt < retry_interval:
                 continue
             self._attempt(track, frame, now)
-            done = (always_finalize or not features.plate_detection
-                    or state.best_score >= tcfg.accept_score or state.attempts >= tcfg.max_attempts)
+            has_plate = bool(state.best and state.best["plate_detected"])
+            done = (
+                always_finalize or not features.plate_detection
+                or (has_plate and state.best_score >= tcfg.accept_score)
+                or (has_plate and state.attempts >= tcfg.max_attempts)
+                or (not has_plate and state.attempts >= tcfg.no_plate_max_attempts)
+            )
             if done:
                 stored += self._finalize(track)
 
@@ -154,6 +180,7 @@ class VehicleMode(DetectionMode):
         prediction = track.det
 
         # 3. Crop vehicle
+        original_vehicle_crop = crop_box(frame, prediction, crop_cfg.vehicle_padding_ratio, 0)
         vehicle_crop = crop_box(frame, prediction, crop_cfg.vehicle_padding_ratio, crop_cfg.vehicle_min_crop_height)
         if vehicle_crop is None:
             return
@@ -163,12 +190,43 @@ class VehicleMode(DetectionMode):
         plate_crop: Optional[np.ndarray] = None
         plate_box = (None, None, None, None)
         if cfg.features.plate_detection:
-            plate_predictions = detector.detect(
-                self.plate_model, vehicle_crop,
-                cfg.model.plate_conf_threshold, cfg.model.vehicle_iou_threshold,
-                cfg.model.plate_imgsz,
-            )
-            if plate_predictions:
+            with timer("plate_detect").measure():
+                plate_predictions = detector.detect(
+                    self.plate_model, vehicle_crop,
+                    # Keep weak candidates so rejections can be counted, but not ~every anchor (conf 0.0 made NMS
+                    # run on thousands of boxes: about +200 ms per try on a desktop CPU).
+                    min(0.25, cfg.model.plate_conf_threshold) if cfg.plate_validation.enabled
+                    else cfg.model.plate_conf_threshold,
+                    cfg.model.vehicle_iou_threshold,
+                    cfg.model.plate_imgsz,
+                )
+            if cfg.plate_validation.enabled:
+                valid_plates = []
+                if original_vehicle_crop is not None:
+                    scale_x = original_vehicle_crop.shape[1] / vehicle_crop.shape[1]
+                    scale_y = original_vehicle_crop.shape[0] / vehicle_crop.shape[0]
+                    for candidate in plate_predictions:
+                        mapped = dict(candidate)
+                        mapped["x"] = float(candidate["x"]) * scale_x
+                        mapped["y"] = float(candidate["y"]) * scale_y
+                        mapped["width"] = float(candidate["width"]) * scale_x
+                        mapped["height"] = float(candidate["height"]) * scale_y
+                        rejections = self._plate_rejections(original_vehicle_crop, mapped)
+                        if rejections:
+                            for rejection in rejections:
+                                state.rejections[rejection] = state.rejections.get(rejection, 0) + 1
+                            continue
+                        crop = crop_plate(
+                            original_vehicle_crop, mapped,
+                            crop_cfg.plate_padding_pixels, crop_cfg.plate_min_crop_height,
+                            crop_cfg.plate_padding_ratio,
+                        )
+                        if crop is not None:
+                            valid_plates.append((float(candidate.get("confidence", 0.0)), mapped, crop))
+                if valid_plates:
+                    plate_confidence, best_plate, plate_crop = max(valid_plates, key=lambda item: item[0])
+                    plate_box = box_edges(best_plate)
+            elif plate_predictions:
                 best_plate = max(plate_predictions, key=lambda p: p.get("confidence", 0.0))
                 crop = crop_plate(
                     vehicle_crop, best_plate,
@@ -187,18 +245,59 @@ class VehicleMode(DetectionMode):
 
         # Only the winning try is JPEG-encoded (keeps the CPU cost of retries low).
         vx1, vy1, vx2, vy2 = box_edges(prediction)
+        vehicle_jpeg = encode_jpeg(vehicle_crop, cfg.images.jpeg_quality)
+        plate_jpeg = encode_jpeg(plate_crop, cfg.images.plate_jpeg_quality) if plate_crop is not None else None
         state.best_score = score
         state.best = {
             "class": str(prediction.get("class") or "vehicle"),
             "vehicle_confidence": vehicle_confidence,
-            "vehicle_jpeg": encode_jpeg(vehicle_crop, cfg.images.jpeg_quality),
+            "vehicle_jpeg": vehicle_jpeg,
+            "vehicle_size": (vehicle_crop.shape[1], vehicle_crop.shape[0]),
             "vehicle_box": (vx1, vy1, vx2, vy2),
             "plate_detected": plate_crop is not None,
+            "plate_thumb": RecentPlates.make_thumb(plate_crop) if plate_crop is not None else None,
             "plate_confidence": plate_confidence,
-            "plate_jpeg": encode_jpeg(plate_crop, cfg.images.plate_jpeg_quality) if plate_crop is not None else None,
+            "plate_jpeg": plate_jpeg,
+            "plate_size": (plate_crop.shape[1], plate_crop.shape[0]) if plate_crop is not None else None,
             "plate_box": plate_box,
+            "frame_size": (frame.shape[1], frame.shape[0]),
             "at": datetime.now(),
         }
+
+    def _plate_rejections(self, vehicle_crop: np.ndarray, plate: Dict[str, Any]) -> List[str]:
+        cfg = self.config.plate_validation
+        confidence = float(plate.get("confidence", 0.0))
+        if confidence < self.config.model.plate_conf_threshold:
+            return ["confidence"]
+        plate_width, plate_height = float(plate["width"]), float(plate["height"])
+        if plate_width <= 0 or plate_height <= 0:
+            return ["size"]
+        aspect = plate_width / plate_height
+        if not cfg.min_aspect_ratio <= aspect <= cfg.max_aspect_ratio:
+            return ["aspect"]
+        crop_height, crop_width = vehicle_crop.shape[:2]
+        center_x, center_y = float(plate["x"]) / crop_width, float(plate["y"]) / crop_height
+        if not cfg.min_center_x_ratio <= center_x <= cfg.max_center_x_ratio or center_y < cfg.min_center_y_ratio:
+            return ["position"]
+        width_ratio = plate_width / crop_width
+        if not cfg.min_width_ratio <= width_ratio <= cfg.max_width_ratio:
+            return ["size"]
+
+        raw_crop = crop_plate(
+            vehicle_crop, plate, self.config.crop.plate_padding_pixels,
+            min_crop_height=0, padding_ratio=self.config.crop.plate_padding_ratio,
+        )
+        if raw_crop is None:
+            return ["size"]
+        small = raw_crop.shape[0] < cfg.min_height_px
+        gray = cv2.cvtColor(raw_crop, cv2.COLOR_BGR2GRAY)
+        blurry = float(cv2.Laplacian(gray, cv2.CV_64F).var()) < cfg.min_sharpness
+        reasons = []
+        if small:
+            reasons.append("small")
+        if blurry:
+            reasons.append("blurry")
+        return reasons
 
     def _finalize(self, track: Track) -> int:
         """5. Store the best result for this vehicle (once) - enqueue to the shared SQLite buffer."""
@@ -211,7 +310,19 @@ class VehicleMode(DetectionMode):
             return 0
 
         features = self.config.features
+        if features.plate_detection and not best["plate_detected"] and not features.store_without_plate:
+            return 0
         track_id = f"v{track.id}"
+        if best["plate_detected"] and features.dedupe_enabled:
+            now = time.monotonic()
+            similarity = self.recent_plates.best_match(
+                best["plate_thumb"], now, best["class"], best["vehicle_box"],
+            )
+            if similarity >= features.dedupe_similarity:
+                log.info("[vehicle] %s dropped as duplicate (similarity %.2f)", track_id, similarity)
+                return 0
+            self.recent_plates.add(best["plate_thumb"], now, best["class"], best["vehicle_box"])
+            log.debug("[vehicle] %s plate dedupe similarity %.2f", track_id, similarity)
         stem = f"{self._session_tag}_{track_id}"
         disk_files: Optional[Dict[str, bytes]] = {} if features.save_images_to_disk else None
         if disk_files is not None:
@@ -222,6 +333,7 @@ class VehicleMode(DetectionMode):
         vx1, vy1, vx2, vy2 = best["vehicle_box"]
         px1, py1, px2, py2 = best["plate_box"]
         self.buffer.enqueue(VehicleRecord(
+            event_uuid=str(uuid.uuid4()),
             track_id=track_id,
             camera_source=self.camera_source,
             vehicle_class=best["class"],
@@ -238,9 +350,25 @@ class VehicleMode(DetectionMode):
 
         if features.print_console:
             status = f"plate found ({best['plate_confidence']:.2f})" if best["plate_detected"] else "no plate"
+            if not best["plate_detected"]:
+                rejected = self._format_rejections(state.rejections)
+                if rejected:
+                    status += f" (rejected: {rejected})"
+            frame_width, frame_height = best["frame_size"]
+            vehicle_width, vehicle_height = best["vehicle_size"]
+            details = (f"frame {frame_width}x{frame_height}, vehicle {vehicle_width}x{vehicle_height} "
+                       f"({len(best['vehicle_jpeg']) / 1024:.0f} KB)")
+            if best["plate_jpeg"] is not None:
+                plate_width, plate_height = best["plate_size"]
+                details += f", plate {plate_width}x{plate_height} ({len(best['plate_jpeg']) / 1024:.0f} KB)"
             print(f"[vehicle] {track_id} {best['class']} ({best['vehicle_confidence']:.2f}) - {status} "
-                  f"[{state.attempts} try/tries]")
+                  f"[{details}] [{state.attempts} tries]")
         return 1
+
+    @staticmethod
+    def _format_rejections(rejections: Dict[str, int]) -> str:
+        order = ("confidence", "aspect", "position", "size", "small", "blurry")
+        return ", ".join(f"{reason} {rejections[reason]}" for reason in order if rejections.get(reason))
 
     def _flush_pending(self) -> None:
         """Hand every vehicle still being followed to storage (mode switch / shutdown): nothing is lost."""
