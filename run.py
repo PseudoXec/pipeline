@@ -20,7 +20,7 @@ from camera.roi_manager import RoiManager
 from config.config import PipelineConfig
 from control.mode_manager import ModeManager, choose_initial_mode
 from modes.base import RuntimeContext
-from storage.buffer import SQLiteBuffer
+from storage.buffer import DetectionBuffer
 
 log = logging.getLogger("pipeline")
 
@@ -69,8 +69,12 @@ def main() -> None:
     initial_mode = choose_initial_mode(config, args.mode)
 
     # Shared services for the detection flows
-    api_sender = ApiSender(config.api, camera_info)
-    buffer = SQLiteBuffer(config, camera_info, api_sender).start()
+    api_sender = None
+    if config.switches.api and config.api.websocket_host:
+        api_sender = ApiSender(config.api, camera_info)
+    elif config.switches.api:
+        log.warning("[api] api.websocket_host is empty - detections will not be sent")
+    buffer = DetectionBuffer(config, camera_info, api_sender).start()
     roi = RoiManager(config)
     roi.start_polling()
 
@@ -107,7 +111,7 @@ def main() -> None:
     finally:
         manager.stop()
         roi.stop()
-        log.info("flushing storage buffer before exit...")
+        log.info("stopping detection buffer...")
         buffer.stop()
 
 

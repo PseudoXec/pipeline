@@ -6,7 +6,7 @@ import numpy as np
 
 from camera.roi_manager import RoiManager
 from config.config import PipelineConfig
-from storage.buffer import SQLiteBuffer
+from storage.buffer import DetectionBuffer
 
 
 @dataclass
@@ -14,7 +14,7 @@ class RuntimeContext:
     config: PipelineConfig
     camera_source: str
     camera_info: Optional[Any]
-    buffer: SQLiteBuffer
+    buffer: DetectionBuffer
     roi: RoiManager
     session_id: str
 

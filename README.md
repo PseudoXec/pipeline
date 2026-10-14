@@ -22,9 +22,9 @@ config/    config.yaml       Global switches and mode settings
 core/                        Shared engine: detector.py, geometry.py, tracker.py (ByteTrack-style), urls.py
 camera/    config.py/.yaml   Camera + ROI polygon
            camera.py  isapi_client.py  roi_manager.py  resolve.py  frame_loop.py
-api/       config.py/.yaml   Command-center endpoint URLs
-           sender.py  roi_client.py  camera_source_client.py  result.py
-storage/   config.py/.yaml   Shared SQLite buffer settings
+api/       config.py/.yaml   Command-center WebSocket host, camera id, ROI endpoint
+           sender.py  ws_client.py  roi_client.py  camera_source_client.py  result.py
+storage/   config.py/.yaml   Send buffer settings (disk-copy folder)
            buffer.py  reset_buffer.py
 control/   mode_manager.py   Detection mode manager
 modes/     base.py  registry.py  idle.py
@@ -39,8 +39,8 @@ docs/      CHANGES.md  person-api-contract.md
 ## 2. Shared Services
 
 Both flows share:
-- **SQLite buffer (`storage/buffer.py`)**: A SQLite-only batching writer, optional image-file writer, and separate sender thread; WAL mode, retry backoff (5 seconds up to 60 seconds, a pass stops after 3 straight failures), rejection cleanup, and three-day retention for unsent rows.
-- **Unified API Sender (`api/sender.py`)**: Sends metadata to the existing endpoints for vehicle detections (`api.vehicle_endpoint_url`) and person events (`api.person_endpoint_url`).
+- **In-memory buffer (`storage/buffer.py`)**: The frame loop enqueues records (never blocks); a background thread dequeues them and sends over WebSocket. Max 500 queued records: while the socket is down they wait and are sent as soon as it reconnects; if the queue fills, new detections are dropped with a warning. Unsent records are lost on restart/power loss. Optional image-file writer kept for spot checks.
+- **Unified API Sender (`api/sender.py`, `api/ws_client.py`)**: Sends vehicle and person metadata as JSON over one WebSocket (`api.websocket_host`, `api.camera_id`); images are base64-encoded inside the JSON. Reconnects automatically with backoff.
 - **ROI Manager (`camera/roi_manager.py`)**: Synchronizes detection polygon with the command center.
 
 ## 3. Installation
@@ -59,15 +59,12 @@ used only to export models; they are not imported by the runtime pipeline.
 - `runtime.inference_threads` defaults to `3` for the Pi 5; set it back to `2` if FPS drops.
 - Both modes use `frame_skip.enabled`, `motion_threshold`, `follow_every_n`, and
   `idle_heartbeat_seconds` to gate idle inference. Single-image and folder runs always infer.
-- `save_images_to_disk: false` avoids optional JPEG copies; SQLite buffering remains enabled.
-- `storage.max_reject_attempts: 3` drops a record only after three permanent API rejections;
-  transient failures use exponential backoff and are not counted against that limit.
+- `save_images_to_disk: false` avoids optional JPEG copies; the in-memory send queue is always on.
+- Delivery only needs `api.websocket_host` and `api.camera_id`. `roi_endpoint_url` is still used for the HTTP ROI / camera-source fetch.
 - Vehicle plate thumbnails are compared locally for 30 seconds to suppress repeated reports;
   this does not deduplicate an event whose API reply was lost. Configure
   `features.dedupe_enabled`, `dedupe_window_seconds`, `dedupe_similarity`, and `dedupe_min_box_iou`
   in vehicle mode (same class, overlapping vehicle box, and similar plate crop are all required).
-- `api.send_vehicle_event_id: false` is off by default; enable it only if the command center API
-  ignores repeated `EventId` values.
 
 | Config key | Default | Behavior |
 |---|---:|---|

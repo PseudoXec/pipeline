@@ -1,10 +1,5 @@
-# One SQLite file holds every mode's table (vehicle: `detections`, person: `person_detections`).
-# Relative paths here are relative to the project root. Per-mode storage options (JPEG quality, whether to
-# send to the API, which columns to fill) are in modes/<mode>/config.yaml.
+# Detection buffer: records wait in an in-memory queue (max 500) and are sent over the WebSocket by a background
+# thread. Nothing is written to a database; unsent records are lost on restart. Per-mode options (JPEG quality,
+# whether to send, which events to keep) are in modes/<mode>/config.yaml.
 storage:
-  database_path: "data/pipeline_buffer.db"
-  output_dir: "output"
-  retention_days: 3
-  max_unsynced_days: 3
-  delete_disk_images_after_send: true
-  max_reject_attempts: 3
+  output_dir: "output"   # only used when save_images_to_disk is on (spot-check JPEG copies)

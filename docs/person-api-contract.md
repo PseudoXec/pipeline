@@ -1,3 +1,8 @@
+> **Superseded transport.** Person events are no longer sent as `multipart/form-data` HTTP POSTs. The same fields are now
+> sent as one JSON message over the WebSocket (`api.websocket_host`), with `PersonImage` / `FaceImage` base64-encoded.
+> The field names below still apply, except `EventId`, `DeviceId` and `SessionId`, which are no longer sent, and `DetectedAt`, which is now `TimeStamp` (UTC, `2026-10-14T14:32:05Z`, same as vehicles). `TrackId` is still sent and is now `<start time>_p<n>`, e.g. `20261014_143205_p7`;
+> the HTTP/multipart, idempotency (409) and SQLite details do not apply.
+
 # Person event API: what the Pi sends to the command center
 
 For the command-center (C#) team. The Pi detects people and finds a face in each one. It does **not** identify

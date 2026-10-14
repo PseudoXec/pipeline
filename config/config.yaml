@@ -2,8 +2,8 @@
 # GLOBAL SWITCHES ONLY. The settings behind each switch live in the folder that owns them:
 #
 #   camera/config.yaml         the camera (RTSP URL...) and the ROI polygon
-#   api/config.yaml            command-center endpoint URLs
-#   storage/config.yaml        the shared SQLite buffer (paths, retention)
+#   api/config.yaml            command-center WebSocket host, camera id, ROI endpoint
+#   storage/config.yaml        the in-memory send buffer (disk copy folder)
 #   modes/vehicle/config.yaml  everything vehicle mode needs (models, thresholds, ROI rules ...)
 #   modes/person/config.yaml   everything person mode needs  (models, face search, ROI rules ...)
 #

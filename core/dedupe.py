@@ -26,6 +26,12 @@ class RecentPlates:
         gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
         return cv2.resize(gray, (96, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
 
+    @staticmethod
+    def make_vehicle_thumb(vehicle_bgr: np.ndarray) -> np.ndarray:
+        """Small grayscale thumbnail of the whole vehicle crop (used to dedupe vehicles that have no plate)."""
+        gray = cv2.cvtColor(vehicle_bgr, cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float32)
+
     def best_match(self, thumb: np.ndarray, now: float, vehicle_class: Optional[str] = None,
                    vehicle_box: Optional[Tuple[float, float, float, float]] = None) -> float:
         """Highest plate similarity against recent events of the same vehicle class at about the same spot.

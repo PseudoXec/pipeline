@@ -1,3 +1,3 @@
-from storage.buffer import PersonRecord, SQLiteBuffer, VehicleRecord, encode_jpeg
+from storage.buffer import DetectionBuffer, PersonRecord, VehicleRecord, encode_jpeg
 
-__all__ = ["SQLiteBuffer", "VehicleRecord", "PersonRecord", "encode_jpeg"]
+__all__ = ["DetectionBuffer", "VehicleRecord", "PersonRecord", "encode_jpeg"]

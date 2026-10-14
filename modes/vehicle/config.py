@@ -76,11 +76,11 @@ class FeaturesConfig:
     save_images_to_disk: bool = False
     print_console: bool = True
     send_via_api: bool = True
-    delete_row_after_api_send: bool = True
     store_without_plate: bool = True
     dedupe_enabled: bool = True
     dedupe_window_seconds: float = 30.0
     dedupe_similarity: float = 0.85
+    no_plate_dedupe_similarity: float = 0.90
     dedupe_min_box_iou: float = 0.4
 
 

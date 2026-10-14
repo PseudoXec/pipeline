@@ -34,7 +34,7 @@ class RuntimeConfig:
     max_frames: int = 0
     device_id: Optional[str] = None             # stamped on person events; default = this machine's hostname
     device: Optional[str] = None                # model device, null = auto
-    inference_threads: int = 3                  # Set back to 2 if FPS drops (Pi 5 has 4 cores)
+    inference_threads: int = 0                  # ONNX Runtime CPU threads: 0 = auto, -1 = no limit
 
 
 @dataclass
@@ -87,8 +87,9 @@ class PipelineConfig:
             self.person.send_via_api = False
             self.switches.roi_fetch_from_api = False
             self.camera.source_mode = "static"
+            self.api.websocket_host = ""
 
-        if not self.person.send_via_api or not self.api.person_endpoint_url:
+        if not self.person.send_via_api or not self.api.websocket_host:
             self.person.send_via_api = False
 
         if self.mode.default not in self.mode.allowed:

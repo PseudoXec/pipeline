@@ -1,9 +1,6 @@
 # Command-center API. The master on/off switch is `switches.api` in config/config.yaml.
 api:
-  vehicle_endpoint_url: "http://COMMAND_CENTER_IP:5086/api/AiDetection/PlateDetected" # vehicle / plate events
-  send_vehicle_event_id: false
-  person_endpoint_url: null # person events - contract in docs/person-api-contract.md
-  timeout_seconds: 5.0
+  websocket_host: "https://COMMAND_CENTER_HOST"  # WebSocket host: https:// -> wss:// (encrypted); http:// -> ws:// (plain text)
   roi_endpoint_url: "http://COMMAND_CENTER_IP:5086/api/AiDetection/roi-coordinates"
   camera_id: 4
   roi_fetch_timeout_seconds: 3.0

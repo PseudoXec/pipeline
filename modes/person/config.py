@@ -67,7 +67,6 @@ class PersonConfig:
     save_images_to_disk: bool = False
     send_via_api: bool = True
     store_without_face: bool = True
-    delete_row_after_api_send: bool = True
 
     tracking: TrackingConfig = field(default_factory=lambda: TrackingConfig(max_attempts=5, retry_interval_seconds=0.3, accept_score=0.60))
     frame_skip: FrameSkipConfig = field(default_factory=FrameSkipConfig)

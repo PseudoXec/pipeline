@@ -236,7 +236,7 @@ class PersonMode(DetectionMode):
         }
 
     def _finalize(self, track: Track) -> int:
-        """5. Store the best result for this person (once) - enqueue to the shared SQLite buffer."""
+        """5. Store the best result for this person (once) - enqueue to the in-memory send buffer."""
         state = track.data
         if state.finalized:
             return 0
@@ -258,7 +258,7 @@ class PersonMode(DetectionMode):
             event_uuid=str(uuid.uuid4()),
             device_id=self.config.runtime.device_id or "unknown",
             session_id=self.ctx.session_id,
-            track_id=track_id,
+            track_id=stem,     # unique across restarts / mode switches: <start time>_p<n>
             person_confidence=best["person_confidence"],
             person_image_jpeg=best["person_jpeg"],
             face_detected=best["face_detected"],

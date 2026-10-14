@@ -4,7 +4,7 @@ What "seamless" and "CPU friendly" mean here
 --------------------------------------------
 * Only ONE mode is ever processing frames. The other is not "paused": it is stopped - its worker
   threads are joined and its models are freed - so an unused pipeline costs no CPU and no RAM.
-* The camera reader, ROI polling, SQLite stores and live view are shared and never restart, so the
+* The camera reader, ROI polling, the send buffer and live view are shared and never restart, so the
   stream keeps flowing during a switch.
 * With `mode.preload_on_switch` (default) the NEW mode is loaded and warmed up in the background while
   the OLD mode keeps detecting. The swap itself is one pointer change between two frames, so there is

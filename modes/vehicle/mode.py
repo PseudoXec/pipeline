@@ -45,6 +45,12 @@ class VehicleMode(DetectionMode):
             self.config.features.dedupe_similarity,
             self.config.features.dedupe_min_box_iou,
         )
+        # Same idea for vehicles whose plate could not be read: whole-vehicle thumbnail + class + box overlap.
+        self.recent_vehicles = RecentPlates(
+            self.config.features.dedupe_window_seconds,
+            self.config.features.no_plate_dedupe_similarity,
+            self.config.features.dedupe_min_box_iou,
+        )
         self._session_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._stopped = False
 
@@ -256,6 +262,7 @@ class VehicleMode(DetectionMode):
             "vehicle_box": (vx1, vy1, vx2, vy2),
             "plate_detected": plate_crop is not None,
             "plate_thumb": RecentPlates.make_thumb(plate_crop) if plate_crop is not None else None,
+            "vehicle_thumb": RecentPlates.make_vehicle_thumb(vehicle_crop),
             "plate_confidence": plate_confidence,
             "plate_jpeg": plate_jpeg,
             "plate_size": (plate_crop.shape[1], plate_crop.shape[0]) if plate_crop is not None else None,
@@ -300,7 +307,7 @@ class VehicleMode(DetectionMode):
         return reasons
 
     def _finalize(self, track: Track) -> int:
-        """5. Store the best result for this vehicle (once) - enqueue to the shared SQLite buffer."""
+        """5. Store the best result for this vehicle (once) - enqueue to the in-memory send buffer."""
         state = track.data
         if state.finalized:
             return 0
@@ -313,16 +320,27 @@ class VehicleMode(DetectionMode):
         if features.plate_detection and not best["plate_detected"] and not features.store_without_plate:
             return 0
         track_id = f"v{track.id}"
-        if best["plate_detected"] and features.dedupe_enabled:
+        if features.dedupe_enabled:
             now = time.monotonic()
-            similarity = self.recent_plates.best_match(
-                best["plate_thumb"], now, best["class"], best["vehicle_box"],
-            )
-            if similarity >= features.dedupe_similarity:
-                log.info("[vehicle] %s dropped as duplicate (similarity %.2f)", track_id, similarity)
-                return 0
-            self.recent_plates.add(best["plate_thumb"], now, best["class"], best["vehicle_box"])
-            log.debug("[vehicle] %s plate dedupe similarity %.2f", track_id, similarity)
+            if best["plate_detected"]:
+                similarity = self.recent_plates.best_match(
+                    best["plate_thumb"], now, best["class"], best["vehicle_box"],
+                )
+                if similarity >= features.dedupe_similarity:
+                    log.info("[vehicle] %s dropped as duplicate (similarity %.2f)", track_id, similarity)
+                    return 0
+                self.recent_plates.add(best["plate_thumb"], now, best["class"], best["vehicle_box"])
+                log.debug("[vehicle] %s plate dedupe similarity %.2f", track_id, similarity)
+            else:
+                similarity = self.recent_vehicles.best_match(
+                    best["vehicle_thumb"], now, best["class"], best["vehicle_box"],
+                )
+                if similarity >= features.no_plate_dedupe_similarity:
+                    log.info("[vehicle] %s (no plate) dropped as duplicate (similarity %.2f)", track_id, similarity)
+                    return 0
+                log.debug("[vehicle] %s no-plate dedupe similarity %.2f", track_id, similarity)
+            # remember every sent vehicle's look, so a later plate-less fragment of the same vehicle is caught too
+            self.recent_vehicles.add(best["vehicle_thumb"], now, best["class"], best["vehicle_box"])
         stem = f"{self._session_tag}_{track_id}"
         disk_files: Optional[Dict[str, bytes]] = {} if features.save_images_to_disk else None
         if disk_files is not None:
@@ -334,7 +352,7 @@ class VehicleMode(DetectionMode):
         px1, py1, px2, py2 = best["plate_box"]
         self.buffer.enqueue(VehicleRecord(
             event_uuid=str(uuid.uuid4()),
-            track_id=track_id,
+            track_id=stem,     # unique across restarts / mode switches: <start time>_v<n>
             camera_source=self.camera_source,
             vehicle_class=best["class"],
             vehicle_confidence=best["vehicle_confidence"],

@@ -3,5 +3,6 @@ onnxruntime
 opencv-python>=4.8
 numpy
 pyyaml
-requests>=2.31.0
+requests>=2.31.0      # roi_client.py, camera_source_client.py, isapi_client.py (HTTP)
+websocket-client>=1.6  # detection metadata is sent over WebSocket
 scipy

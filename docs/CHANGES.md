@@ -1,3 +1,20 @@
+# WebSocket + in-memory send path (latest)
+
+- Sending: frame detected -> in-memory queue -> background thread dequeues -> WebSocket send (was: SQLite insert -> thread reads SQLite -> HTTP POST).
+- Disconnect: records wait in the queue (max 500) and go out as soon as the WebSocket reconnects; when full, new detections are dropped with a warning (was: SQLite kept rows, retry every 60 s).
+- Restart / power loss: unsent records in memory are lost (was: survived in SQLite).
+- Config: only `api.websocket_host` and `api.camera_id` are needed to send; removed `vehicle_endpoint_url`, `person_endpoint_url`, `timeout_seconds`, all SQLite/retention keys in `storage/config.yaml` and `delete_row_after_api_send`.
+- Images: base64 inside the JSON payload (was: multipart upload).
+- Dependencies: added `websocket-client`; `requests` stays for `roi_client.py`, `camera_source_client.py` and `isapi_client.py`.
+- Vehicles are sent even without a plate; `Image` is then the vehicle crop (plate crop when a plate was found). Vehicle and person messages both carry `TrackId` (`v12` / `p7`); person messages no longer include `EventId`, `DeviceId`, `SessionId`.
+- Person `DetectedAt` renamed to `TimeStamp` (UTC with `Z`, same format as vehicles).
+- `TrackId` is now `<mode start time>_<v|p><n>` (e.g. `20261014_143205_v12`) so it stays unique across restarts and mode switches; it matches the saved-image file names.
+- Robustness: a record that can never be sent (not serializable / unexpected error) is dropped with a warning instead of blocking the queue; a full queue now drops the OLDEST record so the newest detections are kept.
+- Vehicles without a plate are deduped by whole-vehicle look + class + box overlap (`features.no_plate_dedupe_similarity`, default 0.90).
+- `https://` host -> `wss://` (encrypted). `http://` still works as `ws://` but logs a warning; no scheme now defaults to `wss://`.
+- Fixed: `VehicleRecord` now has the `event_uuid` field the vehicle mode already passed (it would have raised a TypeError).
+- Everything below this section describes earlier passes (SQLite/HTTP era) and is kept for history only.
+
 # Lean pipeline pass (latest)
 
 - Motion/idle frame skipping, YuNet input cap (480 px), person ROI detect, onnxruntime instead of ultralytics, 3 inference threads with timing in the heartbeat.
